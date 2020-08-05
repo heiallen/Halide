@@ -529,31 +529,38 @@ std::string Pipeline::generate_function_name() const {
     return name;
 }
 
+// This essentially is just a getter for contents->jit_target,
+// but also reality-checks that the status of the jit_module and/or wasm_module
+// match what we expect.
+Target Pipeline::get_compiled_jit_target() const {
+    const bool has_wasm = contents->wasm_module.contents.defined();
+    const bool has_native = contents->jit_module.compiled();
+    if (contents->jit_target.arch == Target::WebAssembly) {
+        internal_assert(has_wasm && !has_native);
+    } else if (contents->jit_target.arch != Target::ArchUnknown) {
+        internal_assert(!has_wasm && has_native);
+    } else {
+        internal_assert(!has_wasm && !has_native);
+    }
+    return contents->jit_target;
+}
+
 void Pipeline::compile_jit(const Target &target_arg) {
     user_assert(defined()) << "Pipeline is undefined\n";
+    user_assert(target_arg.os != Target::OSUnknown) << "Cannot compile_jit() for target '" << target_arg << "'\n";
 
     Target target(target_arg);
     target.set_feature(Target::JIT);
     target.set_feature(Target::UserContext);
 
-    debug(2) << "jit-compiling for: " << target_arg << "\n";
-
-    // If we're re-jitting for the same target, we can just keep the
-    // old jit module.
-    if (contents->jit_target == target) {
-        if (target.arch == Target::WebAssembly) {
-            if (contents->wasm_module.contents.defined()) {
-                debug(2) << "Reusing old wasm module compiled for :\n"
-                         << contents->jit_target << "\n";
-                return;
-            }
-        }
-        if (contents->jit_module.compiled()) {
-            debug(2) << "Reusing old jit module compiled for :\n"
-                     << contents->jit_target << "\n";
-            return;
-        }
+    // If we're re-jitting for the same target, we can just keep the old jit module.
+    if (get_compiled_jit_target() == target) {
+        debug(2) << "Reusing old jit module compiled for :\n"
+                 << target << "\n";
+        return;
     }
+
+    debug(2) << "jit-compiling for: " << target_arg << "\n";
 
     // Clear all cached info in case there is an error.
     contents->invalidate_cache();
@@ -1060,12 +1067,10 @@ void Pipeline::realize(RealizationArg outputs, const Target &t,
 
     debug(2) << "Realizing Pipeline for " << target << "\n";
 
-    // If target is unspecified...
     if (target.os == Target::OSUnknown) {
         // If we've already jit-compiled for a specific target, use that.
-        if (contents->jit_module.compiled()) {
-            target = contents->jit_target;
-        } else {
+        target = get_compiled_jit_target();
+        if (target.os == Target::OSUnknown) {
             // Otherwise get the target from the environment
             target = get_jit_target_from_environment();
         }
@@ -1165,12 +1170,14 @@ void Pipeline::realize(RealizationArg outputs, const Target &t,
 }
 
 void Pipeline::infer_input_bounds(RealizationArg outputs, const ParamMap &param_map) {
-    if (!contents->jit_module.compiled() ||
-        contents->jit_target.has_feature(Target::NoBoundsQuery)) {
-        Target target = get_jit_target_from_environment();
-        target.set_feature(Target::NoBoundsQuery, false);
-        compile_jit(target);
-    }
+    // TODO: we should probably just add Target as an argument to infer_input_bounds();
+    // this gives us a state-dependent setup that requires compile_jit() be called
+    // explicitly beforehand. That said, this is arguably an improvement over the
+    // previous setup, which quietly used get_jit_target_from_environment()
+    // if you neglected to call compile_jit() explicitly beforehand.
+    Target target = get_compiled_jit_target();
+    user_assert(target.os != Target::OSUnknown) << "You must explicitly call compile_jit() before calling infer_input_bounds().";
+    user_assert(!target.has_feature(Target::NoBoundsQuery)) << "You may not call call compile_jit() without Target::NoBoundsQuery to use infer_input_bounds().";
 
     // This has to happen after a runtime has been compiled in compile_jit.
     JITFuncCallContext jit_context(jit_handlers());
